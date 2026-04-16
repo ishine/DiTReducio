@@ -1,0 +1,40 @@
+backend: f5tts
+
+paths:
+  backend_code_root: /abs/path/to/F5-TTS
+  backend_ckpt_root: /abs/path/to/F5-TTS/checkpoints
+  calibration_audio_root: /abs/path/to/calibration_audio
+  strategy_output_root: /abs/path/to/DiTReducio/outputs/strategies
+  inference_output_root: /abs/path/to/DiTReducio/outputs/audio
+
+runtime:
+  device: cuda
+  dtype: bfloat16
+  seed: 888
+
+inference:
+  nfe_step: 32
+  cfg_strength: 2.0
+  sway_sampling_coef: -1.0
+  speed: 1.0
+
+calibration:
+  delta: 0.2
+  enable_precheck: true
+  enable_precalibration: true
+  top_ratio: 0.1
+
+method:
+  enable_ts: true
+  enable_bs: true
+  enable_ws: true
+  bs_mode: residual
+
+f5tts:
+  model: F5TTS_v1_Base
+  model_cfg: /abs/path/to/F5-TTS/src/f5_tts/configs/F5TTS_v1_Base.yaml
+  ckpt_file: /abs/path/to/F5-TTS/checkpoints/model.safetensors
+  vocab_file: /abs/path/to/F5-TTS/checkpoints/vocab.txt
+  ref_audio: /abs/path/to/calibration_audio/prompt.wav
+  ref_text: Some call me nature, others call me mother nature.
+  gen_text: Here we generate something just for test.

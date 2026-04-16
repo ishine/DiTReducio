@@ -1,0 +1,775 @@
+import argparse
+import codecs
+import os
+import re
+import json
+import time
+import importlib
+
+from datetime import datetime
+from importlib.resources import files
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import soundfile as sf
+
+try:
+    import tomllib as tomli  # py311+
+except ModuleNotFoundError:
+    import tomli  # type: ignore[no-redef]
+import torch
+import torchaudio
+
+try:
+    from cached_path import cached_path
+except ModuleNotFoundError:
+
+    def cached_path(path: str) -> str:
+        if path.startswith("hf://"):
+            raise ModuleNotFoundError(
+                "cached_path is required for hf:// checkpoint URIs"
+            )
+        return path
+
+
+try:
+    from hydra.utils import get_class
+except ModuleNotFoundError:
+
+    def get_class(path: str):
+        module_path, _, class_name = path.rpartition(".")
+        if not module_path or not class_name:
+            raise ValueError(f"Invalid class path: {path}")
+        module = importlib.import_module(module_path)
+        return getattr(module, class_name)
+
+
+def _to_namespace(value):
+    if isinstance(value, dict):
+        return SimpleNamespace(
+            **{key: _to_namespace(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return [_to_namespace(item) for item in value]
+    return value
+
+
+try:
+    from omegaconf import OmegaConf
+except ModuleNotFoundError:
+    import yaml
+
+    class OmegaConf:  # type: ignore[override]
+        @staticmethod
+        def load(path: str):
+            with open(path, "r", encoding="utf-8") as file:
+                data = yaml.safe_load(file)
+            return _to_namespace(data)
+
+
+from f5_tts.infer.utils_infer import (
+    mel_spec_type,
+    target_rms,
+    cross_fade_duration,
+    nfe_step,
+    cfg_strength,
+    sway_sampling_coef,
+    speed,
+    fix_duration,
+    device,
+    infer_process,
+    load_model,
+    load_vocoder,
+    preprocess_ref_audio_text,
+    remove_silence_for_generated_wav,
+)
+
+from ditreducio.backends.f5tts.hooks import make_view, pre_calibration_hook
+from ditreducio.calibration.hooks import (
+    build_need_cache_output,
+    calibration,
+    calibration_preparation,
+    calibration_reset,
+    pre_calibration,
+    pre_calibration_check,
+    speedup,
+)
+from ditreducio.calibration.util import threshold_q, seed_everything
+from ditreducio.backends.f5tts.flops_tracker import (
+    start_flops_tracking,
+    end_flops_tracking,
+)
+
+
+def patch_torchaudio_load_for_cpu() -> None:
+    def _safe_load(path: str):
+        audio, sample_rate = sf.read(path, dtype="float32")
+        if audio.ndim == 1:
+            audio = np.expand_dims(audio, axis=0)
+        else:
+            audio = np.transpose(audio)
+        return torch.from_numpy(audio), sample_rate
+
+    torchaudio.load = _safe_load
+
+
+parser = argparse.ArgumentParser(
+    prog="python3 infer-cli.py",
+    description="Commandline interface for E2/F5 TTS with Advanced Batch Processing.",
+    epilog="Specify options above to override one or more settings from config.",
+)
+parser.add_argument(
+    "-c",
+    "--config",
+    type=str,
+    default=os.path.join(
+        files("f5_tts").joinpath("infer/examples/basic"), "basic.toml"
+    ),
+    help="The configuration file, default see infer/examples/basic/basic.toml",
+)
+
+parser.add_argument(
+    "--seed",
+    type=int,
+    help="Random seed for reproducibility",
+)
+
+# Note. Not to provide default value here in order to read default from config file
+
+parser.add_argument(
+    "-m",
+    "--model",
+    type=str,
+    help="The model name: F5TTS_v1_Base | F5TTS_Base | E2TTS_Base | etc.",
+)
+parser.add_argument(
+    "-mc",
+    "--model_cfg",
+    type=str,
+    help="The path to F5-TTS model config file .yaml",
+)
+parser.add_argument(
+    "-p",
+    "--ckpt_file",
+    type=str,
+    help="The path to model checkpoint .pt, leave blank to use default",
+)
+parser.add_argument(
+    "-v",
+    "--vocab_file",
+    type=str,
+    help="The path to vocab file .txt, leave blank to use default",
+)
+parser.add_argument(
+    "-r",
+    "--ref_audio",
+    type=str,
+    help="The reference audio file.",
+)
+parser.add_argument(
+    "-s",
+    "--ref_text",
+    type=str,
+    help="The transcript/subtitle for the reference audio",
+)
+parser.add_argument(
+    "-t",
+    "--gen_text",
+    type=str,
+    help="The text to make model synthesize a speech",
+)
+parser.add_argument(
+    "-f",
+    "--gen_file",
+    type=str,
+    help="The file with text to generate, will ignore --gen_text",
+)
+parser.add_argument(
+    "-o",
+    "--output_dir",
+    type=str,
+    help="The path to output folder",
+)
+parser.add_argument(
+    "-w",
+    "--output_file",
+    type=str,
+    help="The name of output file",
+)
+parser.add_argument(
+    "--save_chunk",
+    action="store_true",
+    help="To save each audio chunks during inference",
+)
+parser.add_argument(
+    "--remove_silence",
+    action="store_true",
+    help="To remove long silence found in ouput",
+)
+parser.add_argument(
+    "--load_vocoder_from_local",
+    action="store_true",
+    help="To load vocoder from local dir, default to ../checkpoints/vocos-mel-24khz",
+)
+parser.add_argument(
+    "--vocoder_name",
+    type=str,
+    choices=["vocos", "bigvgan"],
+    help=f"Used vocoder name: vocos | bigvgan, default {mel_spec_type}",
+)
+parser.add_argument(
+    "--vocoder_local_path",
+    type=str,
+    help="Local vocoder checkpoint directory",
+)
+parser.add_argument(
+    "--target_rms",
+    type=float,
+    help=f"Target output speech loudness normalization value, default {target_rms}",
+)
+parser.add_argument(
+    "--cross_fade_duration",
+    type=float,
+    help=f"Duration of cross-fade between audio segments in seconds, default {cross_fade_duration}",
+)
+parser.add_argument(
+    "--nfe_step",
+    type=int,
+    help=f"The number of function evaluation (denoising steps), default {nfe_step}",
+)
+parser.add_argument(
+    "--cfg_strength",
+    type=float,
+    help=f"Classifier-free guidance strength, default {cfg_strength}",
+)
+parser.add_argument(
+    "--sway_sampling_coef",
+    type=float,
+    help=f"Sway Sampling coefficient, default {sway_sampling_coef}",
+)
+parser.add_argument(
+    "--speed",
+    type=float,
+    help=f"The speed of the generated audio, default {speed}",
+)
+parser.add_argument(
+    "--fix_duration",
+    type=float,
+    help=f"Fix the total duration (ref and gen audios) in seconds, default {fix_duration}",
+)
+parser.add_argument(
+    "--device",
+    type=str,
+    help="Specify the device to run on",
+)
+
+parser.add_argument(
+    "--calibration",
+    "-q",
+    action="store_true",
+    help="Calibration mode or not",
+)
+
+parser.add_argument(
+    "--threshold",
+    "-d",
+    type=float,
+    help="Compression thresholld, the larger the more compression",
+)
+
+parser.add_argument(
+    "--methods_path",
+    type=str,
+    default="methods",
+    help="Not use precheck and precalibration",
+)
+
+
+# for ablation
+parser.add_argument(
+    "--nots",
+    action="store_true",
+    help="Not use ts",
+)
+
+parser.add_argument(
+    "--nobs",
+    action="store_true",
+    help="Not use obs",
+)
+
+parser.add_argument(
+    "--nopre",
+    action="store_true",
+    help="Not use precheck and precalibration",
+)
+
+parser.add_argument(
+    "--bs-mode",
+    type=str,
+    default="residual",
+    choices=["residual", "cond_replace", "uncond_replace"],
+    help="Branch skipping mode",
+)
+
+parser.add_argument(
+    "--track_flops",
+    action="store_true",
+    help="Track and display real-time FLOPs during inference",
+)
+
+args = parser.parse_args()
+
+
+# config file
+
+config = tomli.load(open(args.config, "rb"))
+
+
+# command-line interface parameters
+
+model = args.model or config.get("model", "F5TTS_v1_Base")
+ckpt_file = args.ckpt_file or config.get("ckpt_file", "")
+vocab_file = args.vocab_file or config.get("vocab_file", "")
+
+ref_audio = args.ref_audio or config.get(
+    "ref_audio", "infer/examples/basic/basic_ref_en.wav"
+)
+ref_text = (
+    args.ref_text
+    if args.ref_text is not None
+    else config.get("ref_text", "Some call me nature, others call me mother nature.")
+)
+gen_text = args.gen_text or config.get(
+    "gen_text", "Here we generate something just for test."
+)
+gen_file = args.gen_file or config.get("gen_file", "")
+
+output_dir = args.output_dir or config.get("output_dir", "tests")
+
+save_chunk = args.save_chunk or config.get("save_chunk", False)
+remove_silence = args.remove_silence or config.get("remove_silence", False)
+load_vocoder_from_local = args.load_vocoder_from_local or config.get(
+    "load_vocoder_from_local", False
+)
+
+vocoder_name = args.vocoder_name or config.get("vocoder_name", mel_spec_type)
+vocoder_local_path = args.vocoder_local_path or config.get("vocoder_local_path", "")
+target_rms = args.target_rms or config.get("target_rms", target_rms)
+cross_fade_duration = args.cross_fade_duration or config.get(
+    "cross_fade_duration", cross_fade_duration
+)
+nfe_step = args.nfe_step or config.get("nfe_step", nfe_step)
+cfg_strength = args.cfg_strength or config.get("cfg_strength", cfg_strength)
+sway_sampling_coef = args.sway_sampling_coef or config.get(
+    "sway_sampling_coef", sway_sampling_coef
+)
+speed = args.speed or config.get("speed", speed)
+fix_duration = args.fix_duration or config.get("fix_duration", fix_duration)
+device = args.device or config.get("device", device)
+if not str(device).startswith("cuda"):
+    patch_torchaudio_load_for_cpu()
+calibration_mode = args.calibration or config.get("calibration", False)
+delta = args.threshold or config.get("threshold", None)
+methods_path = args.methods_path or config.get("methods_path", "methods")
+
+output_file = args.output_file or config.get("output_file", f"infer_cli_{delta}.wav")
+
+# for ablation
+nots = args.nots or config.get("nots", False)
+nobs = args.nobs or config.get("nobs", False)
+nopre = args.nopre or config.get("nopre", False)
+bs_mode = args.bs_mode or config.get("bs_mode", "residual")
+track_flops = args.track_flops or config.get("track_flops", False)
+if nots:
+    nopre = True  # since no ts, no precheck and precalibration
+
+seed = args.seed or config.get("seed", 888)
+seed_everything(seed)
+
+if delta == 0:
+    delta = None
+# patches for pip pkg user
+if "infer/examples/" in ref_audio:
+    ref_audio = str(files("f5_tts").joinpath(f"{ref_audio}"))
+if "infer/examples/" in gen_file:
+    gen_file = str(files("f5_tts").joinpath(f"{gen_file}"))
+if "voices" in config:
+    for voice in config["voices"]:
+        voice_ref_audio = config["voices"][voice]["ref_audio"]
+        if "infer/examples/" in voice_ref_audio:
+            config["voices"][voice]["ref_audio"] = str(
+                files("f5_tts").joinpath(f"{voice_ref_audio}")
+            )
+
+
+# ignore gen_text if gen_file provided
+
+if gen_file:
+    gen_text = codecs.open(gen_file, "r", "utf-8").read()
+
+
+# output path
+
+wave_path = Path(output_dir) / output_file
+# spectrogram_path = Path(output_dir) / "infer_cli_out.png"
+if save_chunk:
+    output_chunk_dir = os.path.join(output_dir, f"{Path(output_file).stem}_chunks")
+    if not os.path.exists(output_chunk_dir):
+        os.makedirs(output_chunk_dir)
+
+
+# load vocoder
+
+if not vocoder_local_path:
+    if vocoder_name == "vocos":
+        vocoder_local_path = ""  # your path to vocos model
+    elif vocoder_name == "bigvgan":
+        vocoder_local_path = ""  # your path to bigvgan model
+
+vocoder = load_vocoder(
+    vocoder_name=vocoder_name,
+    is_local=load_vocoder_from_local,
+    local_path=vocoder_local_path,
+    device=device,
+)
+
+
+# load TTS model
+
+model_cfg = OmegaConf.load(
+    args.model_cfg
+    or config.get("model_cfg", str(files("f5_tts").joinpath(f"configs/{model}.yaml")))
+)
+model_cls = get_class(f"f5_tts.model.{model_cfg.model.backbone}")
+model_arc = model_cfg.model.arch
+
+repo_name, ckpt_step, ckpt_type = "F5-TTS", 1250000, "safetensors"
+
+if model != "F5TTS_Base":
+    assert vocoder_name == model_cfg.model.mel_spec.mel_spec_type
+
+# override for previous models
+if model == "F5TTS_Base":
+    if vocoder_name == "vocos":
+        ckpt_step = 1200000
+    elif vocoder_name == "bigvgan":
+        model = "F5TTS_Base_bigvgan"
+        ckpt_type = "pt"
+elif model == "E2TTS_Base":
+    repo_name = "E2-TTS"
+    ckpt_step = 1200000
+
+if not ckpt_file:
+    ckpt_file = str(
+        cached_path(f"hf://SWivid/{repo_name}/{model}/model_{ckpt_step}.{ckpt_type}")
+    )
+
+print(f"Using {model}...")
+ema_model = load_model(
+    model_cls,
+    model_arc,
+    ckpt_file,
+    mel_spec_type=vocoder_name,
+    vocab_file=vocab_file,
+    device=device,
+)
+ema_model.transformer.bs_mode = bs_mode
+
+# Build view for shared calibration API
+view = make_view(ema_model)
+
+
+# inference process
+
+
+def main():
+    main_voice = {"ref_audio": ref_audio, "ref_text": ref_text}
+
+    infer_time = 0.0
+
+    if "voices" not in config:
+        voices = {"main": main_voice}
+    else:
+        voices = config["voices"]
+        voices["main"] = main_voice
+    for voice in voices:
+        print("Voice:", voice)
+        print("ref_audio ", voices[voice]["ref_audio"])
+        voices[voice]["ref_audio"], voices[voice]["ref_text"] = (
+            preprocess_ref_audio_text(
+                voices[voice]["ref_audio"], voices[voice]["ref_text"]
+            )
+        )
+        print("ref_audio_", voices[voice]["ref_audio"], "\n\n")
+
+    generated_audio_segments = []
+    reg1 = r"(?=\[\w+\])"
+    chunks = re.split(reg1, gen_text)
+    reg2 = r"\[(\w+)\]"
+    for text in chunks:
+        if not text.strip():
+            continue
+        match = re.match(reg2, text)
+        if match:
+            voice = match[1]
+        else:
+            print("No voice tag found, using main.")
+            voice = "main"
+        if voice not in voices:
+            print(f"Voice {voice} not found, using main.")
+            voice = "main"
+        text = re.sub(reg2, "", text)
+        ref_audio_ = voices[voice]["ref_audio"]
+        ref_text_ = voices[voice]["ref_text"]
+        gen_text_ = text.strip()
+        print(f"Voice: {voice}")
+
+        # -----------Calibration Phase----------------
+        calibrate_hook = None
+        if calibration_mode:
+            # Set ablation parameters
+            ema_model.transformer.nots = nots
+            ema_model.transformer.nobs = nobs
+
+            # 1. pre-check phase
+            pre_hooks = pre_calibration_check(view, pre_calibration_hook, steps=nfe_step)
+
+            infer_process(
+                ref_audio_,
+                ref_text_,
+                gen_text_,
+                ema_model,
+                vocoder,
+                mel_spec_type=vocoder_name,
+                target_rms=target_rms,
+                cross_fade_duration=cross_fade_duration,
+                nfe_step=nfe_step,
+                cfg_strength=cfg_strength,
+                sway_sampling_coef=sway_sampling_coef,
+                speed=speed,
+                fix_duration=fix_duration,
+                device=device,
+            )
+
+            # remove hooks
+            for hook in pre_hooks:
+                hook.remove()
+            # gather similarities
+            similarities = []
+            for blocki in range(len(ema_model.transformer.transformer_blocks)):
+                attn = ema_model.transformer.transformer_blocks[blocki].attn
+                similarities_list_i = list(attn.diagonal_similarities.values())
+                similarities.extend(similarities_list_i)
+
+            similarities = torch.tensor(similarities, device="cpu").numpy()
+
+            # decide threshold with dbscan
+            # the pairs of block and step with higher similarity are more likely to be noisy points,
+            # and among them, the point having the lowest similarity will decide the threshold
+            # threshold = threshold_dbscan(similarities)
+            # threshold = 0.24 # a fixed threshold
+            threshold = threshold_q(
+                similarities, ratio=0.1
+            )  # decide threshold with percentile
+            if nopre:
+                threshold = 1.2  # so that no block would be applied ts first
+
+            # threshold = threshold_q(similarities, ratio=0.055)
+            print(f"Pre Calibration Percentile Threshold: {threshold}")
+
+            ts_first_cnt = 0
+
+            for blocki in range(len(ema_model.transformer.transformer_blocks)):
+                attn = ema_model.transformer.transformer_blocks[blocki].attn
+                attn.ts_first = {}
+                # traverse all the time steps of the similarity for this block.
+                for step, similarity in attn.diagonal_similarities.items():
+                    attn.ts_first[step] = False
+                    if similarity >= threshold:
+                        # print(f"{blocki},{step}")
+                        attn.ts_first[step] = True
+                        ts_first_cnt += 1
+
+                del attn.diagonal_similarities
+
+            print(f"TS First Count: {ts_first_cnt}")
+            calibration_reset(view)  # reset is important
+
+            # 2. pre-calibration phase
+            pre_calibrate_hook = pre_calibration(
+                view, steps=nfe_step, threshold=delta
+            )
+
+            infer_process(
+                ref_audio_,
+                ref_text_,
+                gen_text_,
+                ema_model,
+                vocoder,
+                mel_spec_type=vocoder_name,
+                target_rms=target_rms,
+                cross_fade_duration=cross_fade_duration,
+                nfe_step=nfe_step,
+                cfg_strength=cfg_strength,
+                sway_sampling_coef=sway_sampling_coef,
+                speed=speed,
+                fix_duration=fix_duration,
+                device=device,
+            )
+
+            # remove the hook, now there are some blocks apply TS in specified steps
+            pre_calibrate_hook.remove()
+
+            # count the number of blocks and steps that apply TS
+            ts_cnt = 0
+            for blocki, block in enumerate(ema_model.transformer.transformer_blocks):
+                for method in block.attn.steps_method:
+                    if method == "TS":
+                        ts_cnt += 1
+            print(f"TS Count: {ts_cnt}")
+            calibration_reset(view)  # reset is important
+
+            # 3. calibration phase
+            calibrate_hook = calibration(view, steps=nfe_step, threshold=delta)
+
+            hooks = []
+            if calibrate_hook is not None:
+                hooks.append(calibrate_hook)
+
+            audio_segment, final_sample_rate, spectragram = infer_process(
+                ref_audio_,
+                ref_text_,
+                gen_text_,
+                ema_model,
+                vocoder,
+                mel_spec_type=vocoder_name,
+                target_rms=target_rms,
+                cross_fade_duration=cross_fade_duration,
+                nfe_step=nfe_step,
+                cfg_strength=cfg_strength,
+                sway_sampling_coef=sway_sampling_coef,
+                speed=speed,
+                fix_duration=fix_duration,
+                device=device,
+            )
+
+            for hook in hooks:
+                hook.remove()
+
+            calibration_reset(view)  # reset is important
+
+            # calibration end here and save the methods
+            # method stats
+            ts_cnt = 0
+            bs_cnt = 0
+            none_cnt = 0
+            to_save_methods = {"methods": []}
+            for blocki, block in enumerate(ema_model.transformer.transformer_blocks):
+                for method in block.attn.steps_method:
+                    if method == "TS":
+                        ts_cnt += 1
+                    elif method == "BS":
+                        bs_cnt += 1
+                    else:
+                        none_cnt += 1
+                to_save_methods["methods"].append(block.attn.steps_method)
+            to_save_methods["need_cached_output"] = build_need_cache_output(
+                to_save_methods["methods"]
+            )
+            os.makedirs(methods_path, exist_ok=True)
+            save_path = f"{methods_path}/{nfe_step}_{delta}.json"
+            with open(save_path, "w") as file:
+                file.write(json.dumps(to_save_methods))
+                print(f"Methods saved to {save_path}")
+            print(
+                f"delta: {delta}, TS Count: {ts_cnt}, BS Count: {bs_cnt}, None Count: {none_cnt}"
+            )
+        # -----------Acceleration based on saved methods or not----------------
+        else:
+            if delta is not None:
+                speedup(view, steps=nfe_step, delta=delta, methods_path=methods_path)
+            else:
+                # Speedup and calibration will automatically conduct this function
+                calibration_preparation(view, steps=32)
+            # Start FLOPs tracking if enabled
+            if track_flops:
+                flops_tracker = start_flops_tracking(ema_model)
+                print("FLOPs tracking enabled...")
+
+            use_cuda_timing = device.startswith("cuda") and torch.cuda.is_available()
+            if use_cuda_timing:
+                torch.cuda.synchronize()
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+            else:
+                start_time = time.perf_counter()
+
+            audio_segment, final_sample_rate, spectragram = infer_process(
+                ref_audio_,
+                ref_text_,
+                gen_text_,
+                ema_model,
+                vocoder,
+                mel_spec_type=vocoder_name,
+                target_rms=target_rms,
+                cross_fade_duration=cross_fade_duration,
+                nfe_step=nfe_step,
+                cfg_strength=cfg_strength,
+                sway_sampling_coef=sway_sampling_coef,
+                speed=speed,
+                fix_duration=fix_duration,
+                device=device,
+            )
+
+            if use_cuda_timing:
+                end.record()
+                torch.cuda.synchronize()
+                infer_time += start.elapsed_time(end) / 1000.0
+            else:
+                infer_time += time.perf_counter() - start_time
+
+            # End FLOPs tracking and display results
+            if track_flops:
+                flops_summary = end_flops_tracking()
+                from ditreducio.backends.f5tts.flops_tracker import (
+                    get_flops_tracker,
+                )
+
+                tracker = get_flops_tracker()
+                tracker.print_summary()
+
+            generated_audio_segments.append(audio_segment)
+
+        if save_chunk:
+            if len(gen_text_) > 200:
+                gen_text_ = gen_text_[:200] + " ... "
+            sf.write(
+                os.path.join(
+                    output_chunk_dir,
+                    f"{len(generated_audio_segments) - 1}_{gen_text_}.wav",
+                ),
+                audio_segment,
+                final_sample_rate,
+            )
+
+    if generated_audio_segments:
+        final_wave = np.concatenate(generated_audio_segments)
+
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        with open(wave_path, "wb") as f:
+            sf.write(f.name, final_wave, final_sample_rate)
+            # Remove silence
+            if remove_silence:
+                remove_silence_for_generated_wav(f.name)
+            print(f.name)
+
+    print(f"Total Inference Time: {infer_time:.2f} seconds, delta: {delta}")
+
+
+if __name__ == "__main__":
+    main()

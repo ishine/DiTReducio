@@ -1,0 +1,19 @@
+*/data
+*/__pycache__
+/.vscode
+/.idea
+
+*.pyc
+.venv/
+*.log
+
+# Large output files (audio, strategies, per-delta CSVs)
+third_party/
+logs/
+outputs/
+
+# Claude Code / opencode
+.claude/
+.opencode/
+.ruff_cache/
+.venv/

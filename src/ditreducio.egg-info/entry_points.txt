@@ -1,0 +1,3 @@
+[console_scripts]
+ditreducio-calibrate = ditreducio.cli.calibrate:main
+ditreducio-infer = ditreducio.cli.infer:main
