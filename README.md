@@ -1,30 +1,25 @@
 # DiTReducio: Training-Free Calibration and Acceleration for DiT-based Text-to-Speech
 
-[![ACL 2026 Findings](https://img.shields.io/badge/ACL%202026-Findings-blue)](https://2026.aclweb.org/)
-[![Python 3.12+](https://img.shields.io/badge/Python-3.12+-brightgreen)]()
-[![License](https://img.shields.io/badge/License-Apache%202.0-green)]()
+<a href="https://arxiv.org/abs/2509.09748"><img src="https://img.shields.io/badge/Paper-arXiv-red"></a>
 
-Official implementation of **DiTReducio**, a training-free calibration and acceleration framework for DiT-based text-to-speech models. DiTReducio identifies temporal and branch redundancy in DiT inference and applies progressive compression strategies to achieve significant speedup with minimal quality loss.
+Official implementation of **DiTReducio**, a training-free calibration and acceleration framework for DiT-based text-to-speech models. DiTReducio identifies temporal and branch redundancy in DiT inference and applies compression strategies via progressive calibration to achieve speedup without training cost.
 
 ## News
 
-- **2026/04**: DiTReducio has been accepted at **ACL 2026 Findings**.
+- **2026/04**: 🎉 Our paper has been accepted to **ACL 2026 Findings**! 
 
 ## Overview
 
-DiTReducio introduces two complementary compression strategies:
+DiTReducio is a training-free acceleration framework that eliminates redundant computations in DiT-based TTS models via progressive calibration. 
 
-- **Temporal Skipping (TS)**: Caches module outputs from the preceding timestep and reuses them when temporally redundant, avoiding redundant recomputation.
+### Core Compression Strategies
+- **Temporal Skipping (TS)**: Caches module outputs at a given timestep and reuses them in subsequent steps to avoid temporally redundant computation.
+- **Branch Skipping (BS)**: Skips the redundant unconditional branch in Classifier-Free Guidance and reconstructs it via a **Branch Residual** mechanism to preserve essential guidance details.
 
-- **Branch Skipping (BS)**: Under Classifier-Free Guidance (CFG), skips the unconditional branch and reconstructs it via a **Branch Residual** mechanism that preserves essential guidance details.
-
-The framework operates through a **three-phase progressive calibration**:
-
-1. **Check Phase**: Identifies highly temporally redundant layer-step pairs by analyzing attention pattern similarity with diagonal matrices.
-2. **Pre-Calibration Phase**: Applies TS to the marked pairs for preliminary strategy assignment.
-3. **Calibration Phase**: Performs greedy search over both TS and BS for all remaining pairs using a dynamic threshold.
-
-After calibration, the resulting **strategy table** is saved and can be loaded for plug-and-play accelerated inference.
+### Three-Phase Progressive Calibration
+1. **Check Phase**: Identifies highly temporally redundant layer-step pairs by detecting **diagonal-like attention patterns**.
+2. **Pre-Calibration Phase**: Selectively applies TS to marked pairs to ensure a superior strategy combination and avoid suboptimal compression.
+3. **Calibration Phase**: Systematically applies both TS and BS across all layer-step pairs.
 
 ## Results
 
@@ -61,7 +56,7 @@ DiTReducio requires the upstream TTS model code:
 Or use the provided setup script:
 
 ```bash
-bash scripts/fetch_backends.sh
+bash scripts/fetch_backends.sh <target-root>
 ```
 
 ## Quick Start
@@ -89,7 +84,7 @@ Key path fields:
 Run the three-phase calibration to generate a strategy table:
 
 ```bash
-# F5-TTS (delta=0.20 corresponds to T4)
+# F5-TTS
 python -m ditreducio.cli.calibrate --backend f5tts --config configs/local.f5tts.yaml --delta 0.2
 
 # MegaTTS 3
@@ -108,32 +103,13 @@ python -m ditreducio.cli.infer --backend f5tts --config configs/local.f5tts.yaml
 python -m ditreducio.cli.infer --backend megatts3 --config configs/local.megatts3.yaml --delta 0.8
 ```
 
-### Ablation Presets
-
-```bash
-# Disable pre-check and pre-calibration
-python -m ditreducio.cli.infer --backend f5tts --config configs/local.f5tts.yaml --preset no_pre --delta 0.2
-
-# Only use Branch Skipping
-python -m ditreducio.cli.infer --backend f5tts --config configs/local.f5tts.yaml --preset only_bs --delta 0.2
-
-# Only use Temporal Skipping
-python -m ditreducio.cli.infer --backend f5tts --config configs/local.f5tts.yaml --preset only_ts --delta 0.2
-
-# Branch Skipping with conditional replacement
-python -m ditreducio.cli.infer --backend f5tts --config configs/local.f5tts.yaml --preset bs_cond_replace --delta 0.2
-
-# Branch Skipping with unconditional replacement
-python -m ditreducio.cli.infer --backend f5tts --config configs/local.f5tts.yaml --preset bs_uncond_replace --delta 0.2
-```
-
 ## Experiments
 
 ### Threshold Sweep (T0–T6)
 
 ```bash
 # Full sweep: calibrate + infer + eval for all thresholds
-CUDA_VISIBLE_DEVICES=0 python scripts/run_sweep_f5.py \
+python scripts/run_sweep_f5.py \
     --backend_root /path/to/F5-TTS \
     --f5tts_ckpt /path/to/model_1250000.safetensors \
     --vocoder_path /path/to/vocos-mel-24khz \
@@ -151,8 +127,6 @@ python scripts/run_sweep_f5.py \
 
 ### Evaluation (WER + SIM-o)
 
-Evaluation models are **auto-downloaded** on first use (faster-whisper-large-v3 and ECAPA-TDNN WavLM checkpoint). To use local weights instead, specify the paths:
-
 ```bash
 # Auto-download evaluation models
 python scripts/eval_metrics.py \
@@ -166,75 +140,17 @@ python scripts/eval_metrics.py \
     --device cuda
 ```
 
-### Data Preparation
-
-```bash
-# Generate cross-sentence lst from LibriSpeech JSON
-python scripts/gen_lst.py --data_root /path/to/LibriSpeech
-python scripts/gen_lst_other.py --data_root /path/to/LibriSpeech-other
-```
-
-## Repository Structure
-
-```
-DiTReducio/
-  configs/             # YAML configuration files
-  src/ditreducio/
-    cli/               # calibrate / infer command-line interface
-    core/              # Type definitions, config loading, registry
-    calibration/       # Shared calibration logic:
-                       #   accessor.py  — TransformerView abstraction
-                       #   hooks.py     — shared calibration flow
-                       #   metrics.py   — compression loss
-                       #   timer.py     — CUDA timing
-                       #   util.py      — threshold_q, seed_everything
-    methods/           # TS / BS compression method implementations
-    ablation/          # Ablation preset definitions
-    backends/          # Backend adapters and runtime code:
-                       #   f5tts_adapter.py  / megatts3_adapter.py — subprocess adapters
-                       #   f5tts/       — cli.py, hooks.py, flops_tracker.py, ecapa_tdnn.py
-                       #   megatts3/    — cli.py, hooks.py, flops_tracker.py
-  scripts/             # Experiment scripts:
-                       #   run_sweep_f5.py   — threshold sweep (T0–T6)
-                       #   eval_infer_f5.py  — batch inference
-                       #   eval_metrics.py   — WER + SIM-o evaluation
-                       #   gen_lst.py        — data preparation
-  outputs/             # Experiment outputs
-    strategies/        # Strategy table JSON files
-    audio/             # Generated audio files
-    metrics/           # CSV metric files
-  paper.txt            # Paper source (experiment definitions)
-```
-
-## Architecture
-
-The codebase uses a **TransformerView** abstraction to share calibration logic across backends with different model architectures:
-
-```
-F5-TTS:   model.transformer.transformer_blocks[i].attn / .ff
-MegaTTS3: model.dit.encoder.layers[i].attention / .feed_forward
-                       ↓ TransformerView ↓
-           Shared calibration hooks (calibration_reset, calibration_preparation,
-           pre_calibration, calibration, speedup, ...)
-```
-
-Backend-specific code (efficient forward implementations, attention hooks, FLOPs tracking) lives in `backends/f5tts/` and `backends/megatts3/`, while shared calibration flow is in `calibration/`.
-
 ## Citation
 
 ```bibtex
-@inproceedings{ditreducio2026,
-  title     = {DiTReducio: Training-Free Calibration and Acceleration for DiT-based Text-to-Speech},
-  author    = {},
-  booktitle = {Findings of the Association for Computational Linguistics: ACL 2026},
-  year      = {2026}
+@article{huo2025ditreducio,
+  title={Ditreducio: A training-free acceleration for dit-based tts via progressive calibration},
+  author={Huo, Yanru and Jiang, Ziyue and Tang, Zuoli and Hong, Qingyang and Zhao, Zhou},
+  journal={arXiv preprint arXiv:2509.09748},
+  year={2025}
 }
 ```
 
-## License
-
-This project is licensed under the Apache License 2.0.
-
 ## Acknowledgements
 
-We build upon [F5-TTS](https://github.com/SWivid/F5-TTS) and [MegaTTS3](https://github.com/bytedance/MegaTTS3) for the baseline TTS models. Our approach is inspired by [DiTFastAttn](https://github.com/deep-diver/DiTFastAttn) for attention-based acceleration in diffusion transformers.
+Our approach is inspired by [DiTFastAttn](https://github.com/deep-diver/DiTFastAttn) for training-free acceleration in diffusion transformers. We build upon [F5-TTS](https://github.com/SWivid/F5-TTS) and [MegaTTS3](https://github.com/bytedance/MegaTTS3) for the baseline TTS models. 
