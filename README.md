@@ -153,4 +153,4 @@ python scripts/eval_metrics.py \
 
 ## Acknowledgements
 
-Our approach is inspired by [DiTFastAttn](https://github.com/deep-diver/DiTFastAttn) for training-free acceleration in diffusion transformers. We build upon [F5-TTS](https://github.com/SWivid/F5-TTS) and [MegaTTS3](https://github.com/bytedance/MegaTTS3) for the baseline TTS models. 
+Our approach is inspired by [DiTFastAttn](https://github.com/thu-nics/DiTFastAttn) for training-free acceleration in diffusion transformers. We build upon [F5-TTS](https://github.com/SWivid/F5-TTS) and [MegaTTS3](https://github.com/bytedance/MegaTTS3) for the baseline TTS models. 
